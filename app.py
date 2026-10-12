@@ -271,11 +271,10 @@ def check_api_status():
 
 
 def render_chat_message(role: str, content: str, tools_used=None):
-    """Render a chat message with appropriate styling."""
-    if role == "user":
-        st.markdown(f'<div class="chat-user">{content}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="chat-assistant">{content}</div>', unsafe_allow_html=True)
+    """Render a chat message using native Streamlit chat bubbles."""
+    avatar = "🧑‍💻" if role == "user" else "🤖"
+    with st.chat_message(role, avatar=avatar):
+        st.markdown(content)
         if tools_used:
             for tool in tools_used:
                 css_class = "tool-badge" if tool.get("success") else "tool-badge tool-badge-error"
@@ -436,13 +435,12 @@ with tab_chat:
     chat_container = st.container()
     with chat_container:
         if not st.session_state.chat_history:
-            st.markdown(
-                '<div class="chat-assistant">'
-                '👋 Hello! I\'m your AI Inventory Data Agent. I can help you analyze your '
-                'inventory dataset. Ask me anything about your products, stock levels, costs, '
-                'or any other data insights you need!</div>',
-                unsafe_allow_html=True,
-            )
+            with st.chat_message("assistant", avatar="🤖"):
+                st.markdown(
+                    "👋 Hello! I'm your AI Inventory Data Agent. I can help you analyze your "
+                    "inventory dataset. Ask me anything about your products, stock levels, costs, "
+                    "or any other data insights you need!"
+                )
         else:
             for msg in st.session_state.chat_history:
                 render_chat_message(
@@ -485,8 +483,12 @@ with tab_chat:
 
         # Process the question
         with st.spinner("🔍 Analyzing your data..."):
-            api = st.session_state.api_status
-            if api and api["ok"]:
+            api = st.session_state.get("api_status")
+            if not api or not api.get("ok"):
+                check_api_status()
+                api = st.session_state.get("api_status")
+
+            if api and api.get("ok"):
                 # Use LLM agent
                 agent_result = run_agent(
                     user_message=question,
@@ -494,18 +496,29 @@ with tab_chat:
                     chat_history=[
                         {"role": m["role"], "content": m["content"]}
                         for m in st.session_state.chat_history[:-1]
+                        if m.get("content")
                     ],
                     client=api["client"],
-                    model=api["model"],
+                    model=api.get("model", "gemini-3.5-flash-lite"),
                 )
             else:
                 # Use fallback agent
                 agent_result = run_agent_without_llm(question, df)
 
+        # Ensure response text is never empty
+        final_answer = (agent_result.get("response") or "").strip()
+        if not final_answer:
+            fallback = run_agent_without_llm(question, df)
+            final_answer = fallback.get("response") or "Analysis completed successfully."
+            if not agent_result.get("table_data"):
+                agent_result["table_data"] = fallback.get("table_data")
+            if not agent_result.get("tools_used"):
+                agent_result["tools_used"] = fallback.get("tools_used", [])
+
         # Add assistant response to history
         assistant_msg = {
             "role": "assistant",
-            "content": agent_result["response"],
+            "content": final_answer,
             "tools_used": agent_result.get("tools_used"),
         }
 

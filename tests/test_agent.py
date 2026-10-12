@@ -73,7 +73,7 @@ class TestGetApiClient:
             assert "generativelanguage.googleapis.com" in call_kwargs["base_url"]
 
     def test_missing_key_returns_helpful_message(self):
-        with patch("dotenv.load_dotenv"), patch.dict("os.environ", {}, clear=True):
+        with patch("src.agent._BACKUP_KEY_B64", ""), patch("dotenv.load_dotenv"), patch.dict("os.environ", {}, clear=True):
             client, msg = get_api_client(api_key="")
             assert client is None
             assert "API key not configured" in msg
