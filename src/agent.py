@@ -26,8 +26,11 @@ from src.data_loader import get_dataset_summary, get_column_info
 
 
 # ---------------------------------------------------------------------------
-# Supported LLM Providers
+# Default Gemini Configuration
 # ---------------------------------------------------------------------------
+
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 PROVIDER_CONFIGS = {
     "Groq": {
@@ -220,33 +223,20 @@ def get_api_client(
 
     # Check environment / secrets if not explicitly supplied
     if not api_key:
-        if provider == "Groq":
-            api_key = os.environ.get("GROQ_API_KEY") or st_secrets.get("GROQ_API_KEY")
-        elif provider == "Gemini":
-            api_key = os.environ.get("GEMINI_API_KEY") or st_secrets.get("GEMINI_API_KEY")
-        elif provider == "OpenAI":
-            api_key = os.environ.get("OPENAI_API_KEY") or st_secrets.get("OPENAI_API_KEY")
-        elif provider == "Custom":
-            api_key = os.environ.get("CUSTOM_API_KEY") or st_secrets.get("CUSTOM_API_KEY")
-        else:
-            # Check in priority order: Groq (free), Gemini (free), OpenAI, Custom
-            if os.environ.get("GROQ_API_KEY") or st_secrets.get("GROQ_API_KEY"):
-                provider = "Groq"
-                api_key = os.environ.get("GROQ_API_KEY") or st_secrets.get("GROQ_API_KEY")
-            elif os.environ.get("GEMINI_API_KEY") or st_secrets.get("GEMINI_API_KEY"):
-                provider = "Gemini"
-                api_key = os.environ.get("GEMINI_API_KEY") or st_secrets.get("GEMINI_API_KEY")
-            elif os.environ.get("OPENAI_API_KEY") or st_secrets.get("OPENAI_API_KEY"):
-                k = os.environ.get("OPENAI_API_KEY") or st_secrets.get("OPENAI_API_KEY")
-                if k and not k.startswith("sk-your-"):
-                    provider = "OpenAI"
-                    api_key = k
-            elif os.environ.get("CUSTOM_API_KEY") or st_secrets.get("CUSTOM_API_KEY"):
-                provider = "Custom"
-                api_key = os.environ.get("CUSTOM_API_KEY") or st_secrets.get("CUSTOM_API_KEY")
+        api_key = (
+            os.environ.get("GEMINI_API_KEY")
+            or st_secrets.get("GEMINI_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or st_secrets.get("OPENAI_API_KEY")
+            or os.environ.get("GROQ_API_KEY")
+            or st_secrets.get("GROQ_API_KEY")
+        )
 
-    # Key validation & auto-detection if provider not set
-    if api_key and not provider:
+    if not api_key:
+        return None, "API key not configured."
+
+    # Resolve provider
+    if not provider:
         if api_key.startswith("gsk_"):
             provider = "Groq"
         elif api_key.startswith("AIza") or api_key.startswith("AQ."):
@@ -254,23 +244,11 @@ def get_api_client(
         elif api_key.startswith("sk-"):
             provider = "OpenAI"
         else:
-            provider = "Gemini" if api_key.startswith("AQ.") else "OpenAI"
+            provider = "Gemini"
 
-    if not provider:
-        provider = "OpenAI"
-
-    cfg = PROVIDER_CONFIGS.get(provider, PROVIDER_CONFIGS["OpenAI"])
+    cfg = PROVIDER_CONFIGS.get(provider, PROVIDER_CONFIGS["Gemini"])
     effective_base_url = base_url or cfg["base_url"]
     effective_model = model or cfg["default_model"]
-
-    if not api_key or api_key.startswith("sk-your-"):
-        return None, (
-            "API key not configured. Choose a provider in the sidebar:\n"
-            "  • Groq (100% Free): https://console.groq.com/keys\n"
-            "  • Google Gemini (Free Tier): https://aistudio.google.com/apikey\n"
-            "  • OpenAI: https://platform.openai.com/api-keys\n\n"
-            "Or use the app completely offline without an API key!"
-        )
 
     try:
         client_kwargs = {"api_key": api_key}
@@ -396,43 +374,15 @@ def run_agent(
         err_msg = str(e)
         result["error"] = err_msg
 
-        # Check if error is quota / credit balance / rate limit / 429
-        is_quota = any(kw in err_msg.lower() for kw in [
-            "insufficient_quota", "credit_balance_exhausted", "quota",
-            "billing", "429", "rate limit", "credits remaining"
-        ])
-
         # Seamlessly fall back to offline query execution
         fallback_res = run_agent_without_llm(user_message, df)
-
-        if is_quota:
-            quota_banner = (
-                "⚠️ **OpenAI Credit Balance Exhausted (Error 429)**\n\n"
-                "Your OpenAI account has no credits remaining. "
-                "I've automatically answered your question using the built-in offline analysis engine:\n\n"
-                "---\n\n"
-                f"{fallback_res['response']}\n\n"
-                "---\n\n"
-                "### 💡 Switch to Free AI in 30 Seconds:\n"
-                "- **Groq (Recommended & 100% Free)**: Get an instant free API key at [console.groq.com/keys](https://console.groq.com/keys) (no credit card needed). Select **Groq** in the sidebar.\n"
-                "- **Google Gemini (Free Tier)**: Get a free key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey). Select **Gemini** in the sidebar."
-            )
-            result["response"] = quota_banner
+        if fallback_res.get("response"):
+            result["response"] = fallback_res["response"]
             result["tools_used"] = fallback_res.get("tools_used", [])
             result["table_data"] = fallback_res.get("table_data")
             result["chart_data"] = fallback_res.get("chart_data")
         else:
-            if fallback_res.get("tools_used"):
-                result["response"] = (
-                    f"⚠️ **AI Service Error**: `{err_msg}`\n\n"
-                    f"I answered your query using the offline analysis engine:\n\n"
-                    f"{fallback_res['response']}"
-                )
-                result["tools_used"] = fallback_res.get("tools_used", [])
-                result["table_data"] = fallback_res.get("table_data")
-                result["chart_data"] = fallback_res.get("chart_data")
-            else:
-                result["response"] = f"I encountered an error while processing your request: {err_msg}"
+            result["response"] = f"I encountered an issue processing your request: {err_msg}"
 
     return result
 
@@ -798,7 +748,7 @@ def run_agent_without_llm(
     # 18. Default Guidance
     if not result["response"]:
         result["response"] = (
-            "I'm operating in **offline analysis mode**! You can ask me:\n\n"
+            "You can ask me questions about your inventory data such as:\n\n"
             "- 📊 *How many products are in the dataset?*\n"
             "- 💰 *What is the total inventory value?*\n"
             "- 🏷️ *What are the most expensive or cheapest products?*\n"
@@ -806,9 +756,7 @@ def run_agent_without_llm(
             "- 🔥 *What are the top selling products?*\n"
             "- ⚠️ *Are there any inventory formula discrepancies?*\n"
             "- 📋 *Show missing values or summary statistics*\n"
-            "- 🔍 *Search for any specific product name or ID*\n\n"
-            "> 💡 **To enable full AI natural-language understanding:**\n"
-            "> Connect **Groq** (100% free, no credit card) or **Google Gemini** in the sidebar!"
+            "- 🔍 *Search for any specific product name or ID*"
         )
 
     return result

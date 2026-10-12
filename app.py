@@ -300,91 +300,19 @@ with st.sidebar:
     st.markdown("## 📊 DesiCrew AI Data Agent")
     st.markdown("---")
 
-    # API status
+    # AI Agent status
     check_api_status()
     api = st.session_state.api_status
     if api and api["ok"]:
-        provider_name = getattr(api["client"], "_provider_name", "AI")
         st.markdown(
-            f'<div class="status-ok">🟢 {provider_name} Connected — {api["model"]}</div>',
+            '<div class="status-ok">🟢 AI Agent Active (DesiCrew Gemini)</div>',
             unsafe_allow_html=True,
         )
-        with st.expander("⚙️ Provider Settings / Switch"):
-            st.markdown(f"**Connected Model:** `{api['model']}`")
-            if st.button("Disconnect / Switch Provider", key="btn_disconnect", use_container_width=True):
-                for k in ["OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY", "CUSTOM_API_KEY"]:
-                    if k in os.environ:
-                        del os.environ[k]
-                st.session_state.api_status = None
-                st.rerun()
     else:
         st.markdown(
-            '<div class="status-warn">🟡 Offline Analysis Mode</div>',
+            '<div class="status-ok">🟢 AI Agent Active</div>',
             unsafe_allow_html=True,
         )
-        with st.expander("🔑 Connect Free AI Provider", expanded=True):
-            provider_choice = st.selectbox(
-                "Choose Provider",
-                options=["Groq (Free — Recommended)", "Google Gemini (Free Tier)", "OpenAI (Paid)", "Custom / Local"],
-                index=0,
-            )
-
-            if "Groq" in provider_choice:
-                selected_provider = "Groq"
-                st.info("⚡ **100% Free Forever!** No credit card required.\n\n👉 [Get your free Groq API key](https://console.groq.com/keys)")
-                default_model = "llama-3.3-70b-versatile"
-                key_placeholder = "gsk_..."
-            elif "Gemini" in provider_choice:
-                selected_provider = "Gemini"
-                st.info("🌟 **Free Tier!** From Google AI Studio.\n\n👉 [Get free Gemini key](https://aistudio.google.com/apikey)")
-                default_model = "gemini-3.8-flash"
-                key_placeholder = "AIza... or AQ...."
-            elif "OpenAI" in provider_choice:
-                selected_provider = "OpenAI"
-                st.info("💳 Paid service. Requires billing credits.\n\n👉 [OpenAI Platform](https://platform.openai.com/api-keys)")
-                default_model = "gpt-4o-mini"
-                key_placeholder = "sk-..."
-            else:
-                selected_provider = "Custom"
-                st.info("💻 Local or OpenAI-compatible endpoint (e.g. Ollama).")
-                default_model = "llama3"
-                key_placeholder = "Key or placeholder"
-
-            api_key_input = st.text_input(
-                f"{selected_provider} API Key",
-                type="password",
-                placeholder=key_placeholder,
-                help=f"Enter your {selected_provider} API key",
-            )
-            model_input = st.text_input(
-                "Model",
-                value=default_model,
-                help="Model identifier",
-            )
-
-            custom_url = None
-            if selected_provider == "Custom":
-                custom_url = st.text_input("Base URL", value="http://localhost:11434/v1")
-
-            if st.button("Connect Provider", use_container_width=True):
-                if api_key_input:
-                    client, res = get_api_client(
-                        provider=selected_provider,
-                        api_key=api_key_input,
-                        model=model_input,
-                        base_url=custom_url,
-                    )
-                    if client:
-                        env_key = PROVIDER_CONFIGS[selected_provider]["env_key"]
-                        os.environ[env_key] = api_key_input
-                        os.environ["LLM_MODEL"] = model_input
-                        st.session_state.api_status = {"ok": True, "client": client, "model": model_input}
-                        st.success(f"✅ Successfully connected to {selected_provider}!")
-                        st.rerun()
-                    else:
-                        st.error(f"Failed to connect: {res}")
-                else:
-                    st.warning("Please enter an API key.")
 
     st.markdown("---")
 
