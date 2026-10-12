@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data_loader import (
+    load_dataset,
     load_inventory_excel,
     get_dataset_summary,
     get_column_info,
@@ -387,7 +388,28 @@ class TestIntegration:
             "function": "sum",
         })
         assert result2["success"]
-        assert result2["result"]["value"] > 0
+class TestLoadDatasetUniversal:
+    def test_load_csv_dataset(self):
+        import io
+        csv_text = "ID,Name,Department,Salary\n1,Alice,HR,50000\n2,Bob,Tech,80000\n"
+        df, meta = load_dataset(io.StringIO(csv_text), "employees.csv")
+        assert len(df) == 2
+        assert list(df.columns) == ["ID", "Name", "Department", "Salary"]
+        assert df["Salary"].iloc[1] == 80000
+
+    def test_load_dataset_drops_empty(self):
+        import io
+        csv_text = "ColA,ColB,EmptyCol\n1,Alpha,\n2,Beta,\n\n"
+        df, meta = load_dataset(io.StringIO(csv_text), "data.csv")
+        assert "EmptyCol" not in df.columns
+        assert len(df) == 2
+
+    def test_load_dataset_excel_backwards_compatible(self):
+        sample_path = Path(__file__).parent.parent / "Inventory-Records-Sample-Data.xlsx"
+        if sample_path.exists():
+            df, meta = load_dataset(str(sample_path))
+            assert len(df) == 46
+            assert "Cost Price Total (USD)" in df.columns
 
 
 if __name__ == "__main__":

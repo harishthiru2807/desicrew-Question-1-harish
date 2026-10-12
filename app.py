@@ -21,7 +21,7 @@ try:
 except ImportError:
     pass
 
-from src.data_loader import load_inventory_excel, get_dataset_summary, get_column_info
+from src.data_loader import load_dataset, load_inventory_excel, get_dataset_summary, get_column_info
 from src.agent import run_agent, run_agent_without_llm, get_api_client, PROVIDER_CONFIGS
 from src.safe_executor import get_available_operations
 
@@ -243,6 +243,10 @@ if "meta" not in st.session_state:
     st.session_state.meta = None
 if "api_status" not in st.session_state:
     st.session_state.api_status = None
+if "dataset_name" not in st.session_state:
+    st.session_state.dataset_name = None
+if "last_uploaded_file_id" not in st.session_state:
+    st.session_state.last_uploaded_file_id = None
 
 
 # ── Helper functions ───────────────────────────────────────────────────────
@@ -251,9 +255,10 @@ def auto_load_default_dataset():
     default_path = Path(__file__).parent / "Inventory-Records-Sample-Data.xlsx"
     if default_path.exists() and st.session_state.df is None:
         try:
-            df, meta = load_inventory_excel(str(default_path))
+            df, meta = load_dataset(str(default_path), "Inventory-Records-Sample-Data.xlsx")
             st.session_state.df = df
             st.session_state.meta = meta
+            st.session_state.dataset_name = "Inventory-Records-Sample-Data.xlsx"
             return True
         except Exception:
             return False
@@ -319,8 +324,9 @@ with st.sidebar:
     auto_load_default_dataset()
     if st.session_state.df is not None:
         df = st.session_state.df
+        ds_name = st.session_state.get("dataset_name", "Dataset")
         st.markdown(
-            f'<div class="status-ok">📁 Dataset Loaded — {len(df)} products</div>',
+            f'<div class="status-ok">📁 {ds_name} — {len(df):,} rows</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -334,19 +340,36 @@ with st.sidebar:
     # File upload
     st.markdown("### 📤 Upload Dataset")
     uploaded_file = st.file_uploader(
-        "Upload an Excel file (.xlsx)",
-        type=["xlsx", "xls"],
-        help="Upload your inventory Excel file for analysis",
+        "Upload a dataset (.xlsx, .xls, .csv)",
+        type=["xlsx", "xls", "csv", "tsv"],
+        key="sidebar_file_uploader",
+        help="Upload any Excel or CSV dataset for analysis",
     )
     if uploaded_file is not None:
-        try:
-            df, meta = load_inventory_excel(uploaded_file)
-            st.session_state.df = df
-            st.session_state.meta = meta
-            st.success(f"✅ Loaded {len(df)} rows × {len(df.columns)} columns")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error loading file: {str(e)}")
+        file_id = f"side_{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.get("last_uploaded_file_id") != file_id:
+            try:
+                new_df, new_meta = load_dataset(uploaded_file, uploaded_file.name)
+                st.session_state.df = new_df
+                st.session_state.meta = new_meta
+                st.session_state.dataset_name = uploaded_file.name
+                st.session_state.last_uploaded_file_id = file_id
+                cols_preview = ", ".join(f"`{c}`" for c in new_df.columns[:8])
+                if len(new_df.columns) > 8:
+                    cols_preview += f" ... (+{len(new_df.columns)-8} more)"
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": (
+                        f"📁 **Dataset Activated:** `{uploaded_file.name}`\n\n"
+                        f"- **Rows:** **{len(new_df):,}**\n"
+                        f"- **Columns ({len(new_df.columns)}):** {cols_preview}\n\n"
+                        f"I am ready! Ask me any question based on `{uploaded_file.name}`."
+                    )
+                })
+                st.success(f"✅ Loaded {len(new_df):,} rows × {len(new_df.columns)} columns")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error loading file: {str(e)}")
 
     st.markdown("---")
 
@@ -391,13 +414,25 @@ summary = get_dataset_summary(df)
 
 m1, m2, m3, m4, m5 = st.columns(5)
 with m1:
-    st.metric("Total Products", f"{summary['total_products']}")
+    st.metric("Total Records", f"{len(df):,}")
 with m2:
-    val = summary.get("total_inventory_value", 0)
-    st.metric("Inventory Value", f"${val:,.0f}")
+    if "total_inventory_value" in summary:
+        val = summary["total_inventory_value"]
+        st.metric("Inventory Value", f"${val:,.0f}")
+    elif summary.get("numeric_columns"):
+        st.metric("Numeric Columns", f"{len(summary['numeric_columns'])}")
+    else:
+        st.metric("Columns", f"{len(df.columns)}")
 with m3:
-    avg = summary.get("avg_cost_per_unit", 0)
-    st.metric("Avg Unit Cost", f"${avg:,.2f}")
+    if "avg_cost_per_unit" in summary:
+        avg = summary["avg_cost_per_unit"]
+        st.metric("Avg Unit Cost", f"${avg:,.2f}")
+    elif summary.get("numeric_columns"):
+        c0 = summary["numeric_columns"][0]
+        c0_mean = df[c0].mean()
+        st.metric(f"Avg {c0[:12]}", f"{c0_mean:,.2f}" if pd.notna(c0_mean) else "N/A")
+    else:
+        st.metric("Total Cells", f"{df.size:,}")
 with m4:
     if "Number of Units Sold" in df.columns:
         sold = int(df["Number of Units Sold"].sum())
@@ -405,7 +440,7 @@ with m4:
     else:
         st.metric("Columns", f"{len(df.columns)}")
 with m5:
-    st.metric("Missing Values", f"{summary['total_missing']}")
+    st.metric("Missing Values", f"{summary['total_missing']:,}")
 
 st.markdown("")
 
@@ -414,15 +449,83 @@ tab_chat, tab_preview, tab_analytics = st.tabs(["💬 Chat", "📋 Data Preview"
 
 # ── Tab: Chat ──────────────────────────────────────────────────────────────
 with tab_chat:
-    # Suggested questions
+    # ── In-Chat Dataset Document Uploader ──────────────────────────────────
+    with st.expander("📎 Upload or Switch Dataset directly in Chat (.csv, .xlsx, .xls)", expanded=(st.session_state.df is None)):
+        up_col1, up_col2 = st.columns([3, 1])
+        with up_col1:
+            chat_uploaded_file = st.file_uploader(
+                "Upload any dataset document to analyze in this chat",
+                type=["xlsx", "xls", "csv", "tsv"],
+                key="chat_file_uploader",
+                help="Upload any dataset (.csv, .xlsx, .xls). The AI agent will immediately accept it and answer questions based on it!",
+            )
+        with up_col2:
+            cur_name = st.session_state.get("dataset_name", "Default Sample Dataset")
+            st.markdown(f"**Active Dataset:**<br>`{cur_name}`", unsafe_allow_html=True)
+            if st.button("🔄 Reset to Default", key="reset_to_default_btn", use_container_width=True):
+                st.session_state.df = None
+                st.session_state.meta = None
+                st.session_state.dataset_name = None
+                st.session_state.last_uploaded_file_id = None
+                auto_load_default_dataset()
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": "🔄 Reset to default DesiCrew inventory dataset.",
+                })
+                st.rerun()
+
+    if chat_uploaded_file is not None:
+        file_id = f"chat_{chat_uploaded_file.name}_{chat_uploaded_file.size}"
+        if st.session_state.get("last_uploaded_file_id") != file_id:
+            try:
+                new_df, new_meta = load_dataset(chat_uploaded_file, chat_uploaded_file.name)
+                st.session_state.df = new_df
+                st.session_state.meta = new_meta
+                st.session_state.dataset_name = chat_uploaded_file.name
+                st.session_state.last_uploaded_file_id = file_id
+                cols_preview = ", ".join(f"`{c}`" for c in new_df.columns[:8])
+                if len(new_df.columns) > 8:
+                    cols_preview += f" ... (+{len(new_df.columns)-8} more)"
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": (
+                        f"📁 **Dataset Accepted & Activated: `{chat_uploaded_file.name}`**\n\n"
+                        f"- **Total Rows:** **{len(new_df):,}**\n"
+                        f"- **Columns ({len(new_df.columns)}):** {cols_preview}\n\n"
+                        f"I am now ready to answer any questions based on `{chat_uploaded_file.name}`!"
+                    )
+                })
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error loading uploaded dataset: {str(e)}")
+
+    # Dynamic Suggested questions
     st.markdown("**💡 Try asking:**")
     q_cols = st.columns(4)
-    suggestions = [
-        "What are the 5 most expensive products?",
-        "How many products have stock below 30?",
-        "What is the total inventory value?",
-        "Show me missing values in the dataset",
-    ]
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if "Cost Price Total (USD)" in df.columns:
+        suggestions = [
+            "What are the 5 most expensive products?",
+            "How many products have stock below 30?",
+            "What is the total inventory value?",
+            "Show me missing values in the dataset",
+        ]
+    elif num_cols:
+        c_first = num_cols[0]
+        suggestions = [
+            f"What are the top 5 records by {c_first}?",
+            f"What is the average {c_first}?",
+            "Show me summary statistics for this dataset",
+            "Show me missing values in the dataset",
+        ]
+    else:
+        suggestions = [
+            "Show the first 5 rows of the dataset",
+            "What columns are in this dataset?",
+            "Show me missing values in the dataset",
+            "Describe this dataset",
+        ]
+
     for i, suggestion in enumerate(suggestions):
         with q_cols[i]:
             if st.button(suggestion, key=f"suggest_{i}", use_container_width=True):
@@ -469,9 +572,9 @@ with tab_chat:
 
     st.markdown("---")
 
-    # Chat input
     pending = st.session_state.pop("pending_question", None)
-    user_input = st.chat_input("Ask a question about your inventory data...")
+    ds_display = st.session_state.get("dataset_name", "your dataset")
+    user_input = st.chat_input(f"Ask a question about {ds_display}...")
 
     question = pending or user_input
     if question:

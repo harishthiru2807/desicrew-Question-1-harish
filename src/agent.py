@@ -157,23 +157,26 @@ def _get_system_prompt(df: pd.DataFrame) -> str:
         for c in col_info
     )
 
-    return f"""You are an AI Data Analysis Agent for the DesiCrew Solutions Data Science Internship.
-You help users analyze an inventory dataset by answering questions in plain English.
+    inv_val = summary.get("total_inventory_value")
+    inv_line = f"- Total inventory value: ${inv_val:,.2f}\n" if isinstance(inv_val, (int, float)) else ""
+
+    return f"""You are an AI Data Analysis Agent for DesiCrew Solutions.
+You help users analyze any uploaded dataset by answering questions in plain English.
 
 ## Dataset Overview
-- Total products: {summary['total_products']}
-- Columns: {', '.join(summary['columns'])}
-- Total inventory value: ${summary.get('total_inventory_value', 'N/A'):,.2f}
-
+- Total records / rows: {summary['total_products']}
+- Columns ({len(summary['columns'])}): {', '.join(summary['columns'])}
+{inv_line}
 ## Column Details
 {col_descriptions}
 
 ## Your Capabilities
-1. **query_dataset**: Execute safe data operations (filter, sort, aggregate, group, search, etc.)
+1. **query_dataset**: Execute safe data operations (filter, sort, top_n, bottom_n, aggregate, group_by, value_counts, unique_values, describe, head, tail, search_rows, correlation, etc.)
 2. **web_search**: Look up definitions, industry terms, or external context
 
 ## Rules
-- Always use the query_dataset tool to answer data questions — never guess or make up numbers.
+- Always use the query_dataset tool to answer data questions from the currently loaded dataset — never guess or make up numbers.
+- The active dataset has columns: {', '.join(summary['columns'])}. Reference the actual column names in this dataset when calling query_dataset.
 - Use web_search only for definitions or context not available in the dataset.
 - When showing results, be clear whether the answer comes from the dataset or from external search.
 - Present numeric results with appropriate formatting (commas, dollar signs, etc.).
@@ -740,6 +743,60 @@ def run_agent_without_llm(
             })
         else:
             result["response"] = "Units sold column not found."
+
+    # 10b. Generic Top N on any dataset column
+    elif any(w in msg for w in ["top", "highest", "largest", "maximum", "max", "best"]) and not any(w in msg for w in ["what is", "define"]):
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        matched_col = None
+        for c in num_cols:
+            if c.lower() in msg:
+                matched_col = c
+                break
+        if matched_col:
+            n_match = re.search(r'(?:top|highest|largest)\s*(\d+)', msg)
+            n = min(int(n_match.group(1)) if n_match else 5, len(df))
+            top_df = df.nlargest(n, matched_col)
+            result["response"] = f"**Top {n} records with highest `{matched_col}`:**"
+            result["table_data"] = top_df
+            result["tools_used"].append({
+                "tool": "query_dataset", "args": {"operation": "top_n", "column": matched_col, "n": n},
+                "result_summary": f"Top {n} by {matched_col}", "success": True,
+            })
+
+    # 10c. Generic Bottom N on any dataset column
+    elif any(w in msg for w in ["bottom", "lowest", "smallest", "minimum", "min", "worst"]) and not any(w in msg for w in ["what is", "define"]):
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        matched_col = None
+        for c in num_cols:
+            if c.lower() in msg:
+                matched_col = c
+                break
+        if matched_col:
+            n_match = re.search(r'(?:bottom|lowest|smallest)\s*(\d+)', msg)
+            n = min(int(n_match.group(1)) if n_match else 5, len(df))
+            bot_df = df.nsmallest(n, matched_col)
+            result["response"] = f"**Bottom {n} records with lowest `{matched_col}`:**"
+            result["table_data"] = bot_df
+            result["tools_used"].append({
+                "tool": "query_dataset", "args": {"operation": "bottom_n", "column": matched_col, "n": n},
+                "result_summary": f"Bottom {n} by {matched_col}", "success": True,
+            })
+
+    # 10d. Generic Sum / Total on any dataset column
+    elif any(w in msg for w in ["total", "sum of", "overall"]) and not any(w in msg for w in ["total products", "how many", "inventory value"]):
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        matched_col = None
+        for c in num_cols:
+            if c.lower() in msg:
+                matched_col = c
+                break
+        if matched_col:
+            c_sum = df[matched_col].sum()
+            result["response"] = f"The **total `{matched_col}`** across all {len(df)} records is **{c_sum:,.2f}**."
+            result["tools_used"].append({
+                "tool": "query_dataset", "args": {"operation": "aggregate", "function": "sum", "column": matched_col},
+                "result_summary": f"Total {matched_col}: {c_sum}", "success": True,
+            })
 
     # 11. Data Discrepancy / Formula Audit
     elif any(w in msg for w in ["discrepancy", "discrepancies", "mismatch", "inconsistency", "formula error", "audit", "math check"]):

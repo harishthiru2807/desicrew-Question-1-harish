@@ -9,6 +9,7 @@ It also supports arbitrary user-uploaded Excel files with standard headers.
 import pandas as pd
 import numpy as np
 from typing import Optional, Tuple, Dict, Any, List
+from pathlib import Path
 
 
 # Canonical column names for the supplied inventory dataset
@@ -50,52 +51,117 @@ def _normalise_header(raw: str) -> str:
     return _HEADER_MAP.get(key, raw.strip())
 
 
-def load_inventory_excel(
+def load_dataset(
     file_path_or_buffer,
-    *,
-    skip_title_rows: bool = True,
+    filename: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
-    Load an inventory Excel file and return a clean DataFrame plus metadata.
+    Universal dataset loader for any tabular dataset document:
+    - Excel (.xlsx, .xls) with non-standard or standard headers
+    - CSV (.csv), TSV (.tsv) with various encodings and delimiters
 
     Parameters
     ----------
-    file_path_or_buffer : str or file-like
-        Path to the .xlsx file or an uploaded file buffer.
-    skip_title_rows : bool
-        If True, attempt to detect and skip decorative title rows above the header.
+    file_path_or_buffer : str, Path, or file-like buffer
+        Path or buffer of the dataset.
+    filename : str, optional
+        Filename hint to assist format detection.
 
     Returns
     -------
     df : pd.DataFrame
-        Cleaned DataFrame with canonical column names and correct dtypes.
+        Cleaned DataFrame.
     meta : dict
-        Metadata including original_shape, detected_header_row, cleaning_notes.
+        Metadata including raw_shape, final_shape, columns, cleaning_notes.
     """
     meta: Dict[str, Any] = {"cleaning_notes": []}
 
-    # --- Step 1: Read raw without header ----------------------------------
-    raw = pd.read_excel(file_path_or_buffer, header=None)
-    meta["raw_shape"] = raw.shape
+    # Determine file name / format
+    name = filename or ""
+    if not name and hasattr(file_path_or_buffer, "name"):
+        name = file_path_or_buffer.name
+    elif not name and isinstance(file_path_or_buffer, (str, Path)):
+        name = Path(file_path_or_buffer).name
+    name_lower = str(name).lower()
 
-    # --- Step 2: Detect the header row ------------------------------------
-    header_row = _detect_header_row(raw)
-    meta["detected_header_row"] = header_row
+    is_csv = name_lower.endswith(".csv") or name_lower.endswith(".tsv") or name_lower.endswith(".txt")
 
-    if header_row is None:
-        # Fallback: treat the first row as header
-        header_row = 0
-        meta["cleaning_notes"].append(
-            "Could not auto-detect header row; using first row."
-        )
+    if is_csv:
+        # --- Handle CSV / TSV ---
+        df = None
+        for enc in ["utf-8", "utf-8-sig", "latin-1", "cp1252"]:
+            try:
+                if hasattr(file_path_or_buffer, "seek"):
+                    file_path_or_buffer.seek(0)
+                df = pd.read_csv(file_path_or_buffer, sep=None, engine="python", encoding=enc)
+                meta["cleaning_notes"].append(f"Loaded CSV with {enc} encoding.")
+                break
+            except Exception:
+                continue
 
-    # --- Step 3: Extract header and data ----------------------------------
-    headers = raw.iloc[header_row].tolist()
-    df = raw.iloc[header_row + 1 :].copy()
-    df.columns = headers
-    df = df.reset_index(drop=True)
+        if df is None:
+            if hasattr(file_path_or_buffer, "seek"):
+                file_path_or_buffer.seek(0)
+            df = pd.read_csv(file_path_or_buffer, encoding="utf-8", on_bad_lines="skip")
+            meta["cleaning_notes"].append("Loaded CSV with utf-8 fallback.")
 
-    # --- Step 4: Drop fully-empty columns ---------------------------------
+        meta["raw_shape"] = df.shape
+
+        # Clean column names
+        df.columns = [str(c).replace("\n", " ").strip() for c in df.columns]
+
+        # Drop entirely empty columns
+        empty_cols = [c for c in df.columns if df[c].isna().all()]
+        if empty_cols:
+            df = df.drop(columns=empty_cols)
+            meta["cleaning_notes"].append(f"Dropped {len(empty_cols)} empty column(s).")
+
+        # Normalise canonical headers if present
+        df.columns = [_normalise_header(c) for c in df.columns]
+
+        # Drop entirely empty rows
+        df = df.dropna(how="all").reset_index(drop=True)
+
+        # Coerce numeric columns
+        for c in df.columns:
+            if df[c].dtype == object:
+                sample = df[c].dropna().head(20).astype(str)
+                cleaned_sample = sample.str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.strip()
+                if not cleaned_sample.empty and pd.to_numeric(cleaned_sample, errors="coerce").notna().mean() > 0.7:
+                    df[c] = pd.to_numeric(
+                        df[c].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.strip(),
+                        errors="coerce"
+                    )
+
+        meta["final_shape"] = df.shape
+        meta["columns"] = list(df.columns)
+        return df, meta
+
+    # --- Handle Excel ---
+    raw = None
+    try:
+        if hasattr(file_path_or_buffer, "seek"):
+            file_path_or_buffer.seek(0)
+        raw = pd.read_excel(file_path_or_buffer, header=None)
+        meta["raw_shape"] = raw.shape
+        header_row = _detect_header_row(raw)
+        meta["detected_header_row"] = header_row
+
+        if header_row is None:
+            header_row = 0
+            meta["cleaning_notes"].append("Using first row as header.")
+
+        headers = raw.iloc[header_row].tolist()
+        df = raw.iloc[header_row + 1 :].copy()
+        df.columns = headers
+        df = df.reset_index(drop=True)
+    except Exception:
+        if hasattr(file_path_or_buffer, "seek"):
+            file_path_or_buffer.seek(0)
+        df = pd.read_excel(file_path_or_buffer)
+        meta["raw_shape"] = df.shape
+
+    # Drop fully-empty columns
     empty_cols = [c for c in df.columns if df[c].isna().all()]
     if empty_cols:
         df = df.drop(columns=empty_cols)
@@ -107,17 +173,17 @@ def load_inventory_excel(
         df = df.drop(columns=nan_header_cols)
         meta["cleaning_notes"].append(f"Dropped {len(nan_header_cols)} column(s) with NaN headers.")
 
-    # --- Step 5: Normalise column names -----------------------------------
+    # Normalise column names
     df.columns = [_normalise_header(c) for c in df.columns]
 
-    # --- Step 6: Drop fully-empty rows ------------------------------------
+    # Drop fully-empty rows
     before_len = len(df)
     df = df.dropna(how="all").reset_index(drop=True)
     dropped_rows = before_len - len(df)
     if dropped_rows:
         meta["cleaning_notes"].append(f"Dropped {dropped_rows} entirely empty row(s).")
 
-    # --- Step 7: Coerce numeric columns -----------------------------------
+    # Coerce known inventory numeric columns
     numeric_cols = [
         "Opening Stock",
         "Purchase/Stock In",
@@ -130,25 +196,62 @@ def load_inventory_excel(
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Auto-coerce any other column that contains numeric strings
+    for c in df.columns:
+        if c not in numeric_cols and df[c].dtype == object:
+            sample = df[c].dropna().head(20).astype(str)
+            cleaned_sample = sample.str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.strip()
+            if not cleaned_sample.empty and pd.to_numeric(cleaned_sample, errors="coerce").notna().mean() > 0.7:
+                df[c] = pd.to_numeric(
+                    df[c].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False).str.strip(),
+                    errors="coerce"
+                )
+
     meta["final_shape"] = df.shape
     meta["columns"] = list(df.columns)
-
     return df, meta
+
+
+def load_inventory_excel(
+    file_path_or_buffer,
+    *,
+    skip_title_rows: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Backwards-compatible wrapper for load_dataset.
+    """
+    return load_dataset(file_path_or_buffer)
 
 
 def _detect_header_row(raw: pd.DataFrame) -> Optional[int]:
     """
-    Heuristic: the header row is the first row that contains 'Product ID'
-    (case-insensitive, ignoring whitespace/newlines).
+    Detect the header row:
+    1. First check if any row has 'Product ID' (DesiCrew sample layout).
+    2. Check if row 0 has non-empty values across most columns (standard header).
+    3. Look for the first row with multiple string values.
     """
     for idx in range(min(20, len(raw))):
         for val in raw.iloc[idx]:
-            if not isinstance(val, str):
-                continue
-            cleaned = val.replace("\n", " ").strip().lower()
-            if "product id" in cleaned:
+            if isinstance(val, str) and "product id" in val.replace("\n", " ").strip().lower():
                 return idx
-    return None
+
+    # If row 0 has >= 2 non-null string headers and >= 50% non-empty
+    row0 = raw.iloc[0]
+    row0_strings = [v for v in row0 if isinstance(v, str) and v.strip()]
+    if len(row0_strings) >= 2 and len(row0_strings) >= (len(row0.dropna()) * 0.5):
+        return 0
+
+    # Otherwise scan first 10 rows for highest non-empty string count
+    best_row = 0
+    best_count = 0
+    for idx in range(min(10, len(raw))):
+        row = raw.iloc[idx]
+        str_count = sum(1 for v in row if isinstance(v, str) and v.strip())
+        if str_count > best_count:
+            best_count = str_count
+            best_row = idx
+
+    return best_row if best_count >= 2 else 0
 
 
 def get_dataset_summary(df: pd.DataFrame) -> Dict[str, Any]:
