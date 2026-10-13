@@ -10,6 +10,10 @@ Supports multiple LLM providers:
 
 Also provides an extensive offline fallback engine that handles complex
 queries locally without requiring an active API key or credits.
+
+All logic is fully generic — no hardcoded assumptions about the inventory
+dataset.  The active dataset's actual column names and types drive every
+decision.
 """
 
 import json
@@ -85,12 +89,12 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "query_dataset",
             "description": (
-                "Execute a safe, parameterised data operation on the inventory dataset. "
+                "Execute a safe, parameterised data operation on the active dataset. "
                 "Available operations: describe, head, tail, shape, columns, dtypes, "
                 "missing_values, filter, sort, top_n, bottom_n, aggregate, group_by, "
                 "value_counts, unique_values, correlation, select_columns, search_rows, "
                 "calculate_column, percentile, crosstab. "
-                "Use this tool to answer questions that can be answered from the dataset."
+                "Use this tool to answer any question that can be answered from the dataset."
             ),
             "parameters": {
                 "type": "object",
@@ -130,7 +134,8 @@ TOOL_DEFINITIONS = [
             "description": (
                 "Search the web for definitions, explanations, or contextual information "
                 "that cannot be found in the dataset. Use this when the user asks about "
-                "industry terms, acronyms, best practices, or anything not in the data."
+                "industry terms, acronyms, best practices, or anything not in the data. "
+                "Always distinguish external information from dataset-derived findings."
             ),
             "parameters": {
                 "type": "object",
@@ -148,7 +153,10 @@ TOOL_DEFINITIONS = [
 
 
 def _get_system_prompt(df: pd.DataFrame) -> str:
-    """Build the system prompt with dataset context."""
+    """
+    Build the system prompt with dataset context dynamically derived from
+    the active DataFrame.  No hardcoded column names or domain assumptions.
+    """
     summary = get_dataset_summary(df)
     col_info = get_column_info(df)
 
@@ -157,41 +165,58 @@ def _get_system_prompt(df: pd.DataFrame) -> str:
         for c in col_info
     )
 
-    inv_val = summary.get("total_inventory_value")
-    inv_line = f"- Total inventory value: ${inv_val:,.2f}\n" if isinstance(inv_val, (int, float)) else ""
+    numeric_cols = summary.get("numeric_columns", [])
+    cat_cols = summary.get("categorical_columns", [])
+
+    # Build a concise numeric stats snapshot for the prompt
+    num_stats_lines = []
+    for col, stats in (summary.get("numeric_stats") or {}).items():
+        num_stats_lines.append(
+            f"  - {col}: min={stats['min']}, max={stats['max']}, mean={stats['mean']}, sum={stats['sum']}"
+        )
+    num_stats_block = "\n".join(num_stats_lines) if num_stats_lines else "  (none)"
 
     return f"""You are an AI Data Analysis Agent for DesiCrew Solutions.
 You help users analyze any uploaded dataset by answering questions in plain English.
 
-## Dataset Overview
-- Total records / rows: {summary['total_products']}
-- Columns ({len(summary['columns'])}): {', '.join(summary['columns'])}
-{inv_line}
+## Active Dataset Overview
+- Total rows: {summary['total_products']}
+- Total columns: {len(summary['columns'])}
+- Columns: {', '.join(summary['columns'])}
+- Numeric columns ({len(numeric_cols)}): {', '.join(numeric_cols) if numeric_cols else 'none'}
+- Categorical columns ({len(cat_cols)}): {', '.join(cat_cols) if cat_cols else 'none'}
+- Missing values: {summary['total_missing']} total
+
 ## Column Details
 {col_descriptions}
 
+## Numeric Column Statistics
+{num_stats_block}
+
 ## Your Capabilities
-1. **query_dataset**: Execute safe data operations (filter, sort, top_n, bottom_n, aggregate, group_by, value_counts, unique_values, describe, head, tail, search_rows, correlation, etc.)
-2. **web_search**: Look up definitions, industry terms, or external context
+1. **query_dataset**: Execute safe data operations — filter, sort, top_n, bottom_n,
+   aggregate, group_by, value_counts, unique_values, describe, head, tail,
+   search_rows, correlation, select_columns, calculate_column, percentile, crosstab.
+2. **web_search**: Look up definitions, industry terms, or external context.
 
 ## Rules
-- Always use the query_dataset tool to answer data questions from the currently loaded dataset — never guess or make up numbers.
-- The active dataset has columns: {', '.join(summary['columns'])}. Reference the actual column names in this dataset when calling query_dataset.
-- Use web_search only for definitions or context not available in the dataset.
-- When showing results, be clear whether the answer comes from the dataset or from external search.
-- Present numeric results with appropriate formatting (commas, dollar signs, etc.).
-- If a question cannot be answered with the available tools, say so honestly.
-- Suggest visualizations (charts/tables) when they would help communicate the answer.
-- If the user's question is ambiguous, ask for clarification.
-- For complex questions, you may call multiple tools sequentially.
-- Always summarize findings in clear, professional English.
+- Always use the **query_dataset** tool to answer data questions. Never guess or fabricate numbers.
+- Use only the actual column names listed above when calling query_dataset.
+- Use **web_search** only for definitions or context not available in the dataset.
+- Clearly indicate whether an answer comes from the dataset or from an external search.
+- Present numeric results with appropriate formatting (commas, currency symbols, etc.).
+- If a question cannot be answered from the available data or tools, explain why honestly.
+- Suggest visualizations or tables when they would help communicate the answer.
+- If a question is ambiguous, ask for clarification.
+- For complex questions, call multiple tools sequentially.
+- Summarize findings in clear, professional English.
 - When you use a tool, briefly mention which tool and operation you used.
 
 ## Response Format
 - Start with a brief direct answer.
 - Show supporting data (tables, numbers) if relevant.
 - End with any additional insights or suggestions if appropriate.
-- Mark data-sourced answers vs. external information clearly.
+- Mark dataset-sourced answers vs. external information clearly.
 """
 
 
@@ -212,14 +237,12 @@ def get_api_client(
     except ImportError:
         return None, "OpenAI package not installed. Run: pip install openai"
 
-    # Try loading .env
     try:
         from dotenv import load_dotenv
         load_dotenv()
     except ImportError:
         pass
 
-    # Streamlit secrets helper
     st_secrets = {}
     try:
         import streamlit as st
@@ -227,7 +250,6 @@ def get_api_client(
     except Exception:
         pass
 
-    # Check environment / secrets if not explicitly supplied
     if not api_key:
         api_key = (
             os.environ.get("GEMINI_API_KEY")
@@ -246,7 +268,6 @@ def get_api_client(
     if not api_key:
         return None, "API key not configured."
 
-    # Resolve provider
     if not provider:
         if api_key.startswith("gsk_"):
             provider = "Groq"
@@ -266,7 +287,6 @@ def get_api_client(
         if effective_base_url:
             client_kwargs["base_url"] = effective_base_url
         client = OpenAI(**client_kwargs)
-        # Store metadata on client
         client._provider_name = provider
         client._model_name = effective_model
         return client, effective_model
@@ -306,11 +326,9 @@ def run_agent(
         result["response"] = "I'm unable to process your request because the AI API is not configured."
         return result
 
-    # Build messages
     system_prompt = _get_system_prompt(df)
     messages = [{"role": "system", "content": system_prompt}]
 
-    # Add recent chat history (last 20 messages for context, ignoring empty ones)
     for msg in chat_history[-20:]:
         c = msg.get("content")
         if c and isinstance(c, str) and c.strip():
@@ -319,7 +337,6 @@ def run_agent(
     messages.append({"role": "user", "content": user_message})
 
     try:
-        # Candidate models ordered by quota generosity and response speed
         candidate_models = []
         if model:
             candidate_models.append(model)
@@ -331,7 +348,6 @@ def run_agent(
         message = None
         active_model = candidate_models[0]
 
-        # Initial call with candidate model fallback
         for attempt in range(2):
             for m_name in candidate_models:
                 try:
@@ -358,7 +374,6 @@ def run_agent(
         if message is None:
             raise last_exception or Exception("Failed to query AI models.")
 
-        # Process tool calls (up to 5 iterations to prevent infinite loops)
         max_iterations = 5
         iteration = 0
 
@@ -381,14 +396,12 @@ def run_agent(
                     "success": tool_result.get("success", False),
                 })
 
-                # Capture table/chart data from tool results
                 if tool_result.get("success") and isinstance(tool_result.get("result"), pd.DataFrame):
                     result["table_data"] = tool_result["result"]
                 elif tool_result.get("success") and isinstance(tool_result.get("result"), dict):
                     if _is_chartable(tool_result["result"]):
                         result["chart_data"] = tool_result["result"]
 
-                # Serialise tool result for the LLM
                 serialised = _serialise_tool_result(tool_result)
 
                 messages.append({
@@ -397,7 +410,6 @@ def run_agent(
                     "content": serialised,
                 })
 
-            # Get next response with candidate model fallback
             followup_message = None
             followup_last_err = None
             models_to_try = [active_model] + [m for m in candidate_models if m != active_model]
@@ -433,16 +445,15 @@ def run_agent(
         if not final_text:
             if result["tools_used"]:
                 last_tool = result["tools_used"][-1]
-                final_text = f"Analysis completed: {last_tool.get('result_summary', 'Successfully queried the inventory data.')}"
+                final_text = f"Analysis completed: {last_tool.get('result_summary', 'Successfully queried the dataset.')}"
             else:
-                final_text = "I completed the analysis of your inventory data."
+                final_text = "I completed the analysis of your dataset."
         result["response"] = final_text
 
     except Exception as e:
         err_msg = str(e)
         result["error"] = err_msg
 
-        # Seamlessly fall back to offline query execution
         fallback_res = run_agent_without_llm(user_message, df)
         if fallback_res.get("response"):
             result["response"] = fallback_res["response"]
@@ -530,16 +541,21 @@ def _is_chartable(data: Dict) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Generic fallback agent (no LLM required)
+# Fully dynamic — all column references are derived from the active DataFrame.
+# ---------------------------------------------------------------------------
+
 def run_agent_without_llm(
     user_message: str,
     df: pd.DataFrame,
 ) -> Dict[str, Any]:
     """
     A comprehensive fallback agent that answers queries without an LLM.
-    Uses pattern matching and direct data operations to answer common
-    inventory questions reliably.
+    Uses pattern matching and direct Pandas operations on the actual columns
+    of the active dataset.  No hardcoded column names.
     """
-    result = {
+    result: Dict[str, Any] = {
         "response": "",
         "tools_used": [],
         "chart_data": None,
@@ -549,363 +565,335 @@ def run_agent_without_llm(
 
     msg = user_message.lower().strip()
 
-    # 0. Numeric threshold queries (e.g., "stock below 30", "stock < 30", "cost greater than 100")
+    # Derive runtime column sets from the active DataFrame
+    num_cols: List[str] = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols: List[str] = df.select_dtypes(include=["object", "string"]).columns.tolist()
+    all_cols: List[str] = list(df.columns)
+
+    # ------------------------------------------------------------------
+    # Helper: find a numeric column mentioned in the user message
+    # ------------------------------------------------------------------
+    def _find_mentioned_num_col(text: str) -> Optional[str]:
+        for c in num_cols:
+            if c.lower() in text:
+                return c
+        return None
+
+    # ------------------------------------------------------------------
+    # Helper: find a column (any type) mentioned in the user message
+    # ------------------------------------------------------------------
+    def _find_mentioned_col(text: str) -> Optional[str]:
+        for c in all_cols:
+            if c.lower() in text:
+                return c
+        return None
+
+    # ------------------------------------------------------------------
+    # 0. Numeric threshold filter: "column below/above/equal to VALUE"
+    #    Also handles generic phrasing across any numeric column.
+    # ------------------------------------------------------------------
     thresh_match = re.search(
-        r'(stock|cost|price|sold|units)\s*(?:is|are|have|with)?\s*(below|under|less than|<=?|above|over|greater than|more than|>=?|equal to|==?)\s*(\$?\d+(?:\.\d+)?)',
+        r'(below|under|less than|<=?|above|over|greater than|more than|>=?|equal to|==?)\s*\$?([\d,]+(?:\.\d+)?)',
         msg,
     )
-    if not thresh_match:
-        thresh_match = re.search(
-            r'(below|under|less than|<=?|above|over|greater than|more than|>=?)\s*(\$?\d+(?:\.\d+)?)\s*(?:units|dollars)?\s*(?:of\s+)?(stock|cost|price|sold)?',
-            msg,
-        )
-
-    if thresh_match:
-        groups = thresh_match.groups()
-        if len(groups) == 3:
-            if groups[0] in ["below", "under", "less than", "<", "<=", "above", "over", "greater than", "more than", ">", ">="]:
-                op_word, val_str, target_type = groups[0], groups[1], groups[2] or "stock"
+    if thresh_match and num_cols:
+        op_word = thresh_match.group(1).strip()
+        val_str = thresh_match.group(2).replace(",", "")
+        try:
+            num_val = float(val_str)
+            # Which column? Prefer one explicitly mentioned; else first numeric
+            col = _find_mentioned_num_col(msg) or num_cols[0]
+            if op_word in ("below", "under", "less than", "<", "<="):
+                filtered_df = df[df[col] < num_val]
+                op_desc = f"below {num_val:g}"
+            elif op_word in ("above", "over", "greater than", "more than", ">", ">="):
+                filtered_df = df[df[col] > num_val]
+                op_desc = f"above {num_val:g}"
             else:
-                target_type, op_word, val_str = groups[0], groups[1], groups[2]
+                filtered_df = df[df[col] == num_val]
+                op_desc = f"equal to {num_val:g}"
 
-            try:
-                num_val = float(val_str.replace("$", "").strip())
-                col = "Hand-In-Stock"
-                if "cost" in target_type or "price" in target_type:
-                    col = "Cost Price Per Unit (USD)" if "Cost Price Per Unit (USD)" in df.columns else "Cost Price Total (USD)"
-                elif "sold" in target_type or "units" in target_type:
-                    col = "Number of Units Sold" if "Number of Units Sold" in df.columns else "Hand-In-Stock"
+            result["response"] = (
+                f"There are **{len(filtered_df)} rows** where `{col}` is {op_desc}."
+            )
+            result["table_data"] = filtered_df
+            result["tools_used"].append({
+                "tool": "query_dataset",
+                "args": {"operation": "filter", "column": col, "value": num_val},
+                "result_summary": f"Filtered {len(filtered_df)} rows where {col} is {op_desc}",
+                "success": True,
+            })
+        except (ValueError, KeyError):
+            pass
 
-                if col in df.columns:
-                    if op_word in ["below", "under", "less than", "<", "<="]:
-                        filtered_df = df[df[col] < num_val]
-                        op_desc = f"below {int(num_val) if num_val.is_integer() else num_val}"
-                    elif op_word in ["above", "over", "greater than", "more than", ">", ">="]:
-                        filtered_df = df[df[col] > num_val]
-                        op_desc = f"above {int(num_val) if num_val.is_integer() else num_val}"
-                    else:
-                        filtered_df = df[df[col] == num_val]
-                        op_desc = f"equal to {int(num_val) if num_val.is_integer() else num_val}"
-
-                    display_cols = [c for c in ["Product ID", "Product Name", col] if c in df.columns]
-                    result["response"] = (
-                        f"There are **{len(filtered_df)} products** with `{col}` {op_desc}."
-                    )
-                    result["table_data"] = filtered_df[display_cols]
-                    result["tools_used"].append({
-                        "tool": "query_dataset",
-                        "args": {"operation": "filter", "column": col, "value": num_val},
-                        "result_summary": f"Filtered {len(filtered_df)} rows where {col} is {op_desc}",
-                        "success": True,
-                    })
-            except Exception:
-                pass
-
-    # 1. Row count / Total products
-    if not result["response"] and any(w in msg for w in ["how many products", "total products", "number of products", "product count", "how many items", "row count"]):
-        result["response"] = f"The dataset contains **{len(df)} products** across **{len(df.columns)} columns**."
+    # ------------------------------------------------------------------
+    # 1. Row count / shape
+    # ------------------------------------------------------------------
+    if not result["response"] and any(
+        w in msg for w in ["how many rows", "how many records", "row count", "total rows",
+                           "how many products", "total products", "number of products",
+                           "product count", "how many items", "dataset size"]
+    ):
+        rows, cols = df.shape
+        result["response"] = (
+            f"The dataset contains **{rows:,} rows** and **{cols} columns**."
+        )
         result["tools_used"].append({
             "tool": "query_dataset", "args": {"operation": "shape"},
-            "result_summary": f"{len(df)} rows, {len(df.columns)} cols", "success": True,
+            "result_summary": f"{rows} rows, {cols} columns", "success": True,
         })
 
+    # ------------------------------------------------------------------
     # 2. Columns / Schema
-    elif any(w in msg for w in ["columns", "fields", "attributes", "what data", "schema", "features"]):
-        cols = ", ".join(df.columns)
-        result["response"] = f"The dataset has **{len(df.columns)} columns**:\n\n" + "\n".join(f"- `{c}`" for c in df.columns)
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["columns", "fields", "attributes", "what data", "schema", "features", "structure"]
+    ):
+        col_lines = "\n".join(
+            f"- `{c}` ({str(df[c].dtype)})" for c in all_cols
+        )
+        result["response"] = f"The dataset has **{len(all_cols)} columns**:\n\n{col_lines}"
         result["tools_used"].append({
             "tool": "query_dataset", "args": {"operation": "columns"},
-            "result_summary": f"{len(df.columns)} columns", "success": True,
+            "result_summary": f"{len(all_cols)} columns", "success": True,
         })
 
+    # ------------------------------------------------------------------
     # 3. Missing values
-    elif any(w in msg for w in ["missing", "null", "empty", "nan", "blank"]):
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["missing", "null", "empty", "nan", "blank", "na values"]
+    ):
         missing = df.isnull().sum()
         total = int(missing.sum())
         if total == 0:
-            result["response"] = "✅ There are **no missing values** anywhere in the dataset! All fields are complete."
+            result["response"] = "✅ There are **no missing values** anywhere in the dataset — all fields are complete."
         else:
-            details = "\n".join(f"- **{col}**: {count} missing" for col, count in missing.items() if count > 0)
-            result["response"] = f"Found **{total} total missing values** across the dataset:\n{details}"
+            details = "\n".join(
+                f"- **{col}**: {count} missing" for col, count in missing.items() if count > 0
+            )
+            result["response"] = f"Found **{total} total missing values** across the dataset:\n\n{details}"
         result["tools_used"].append({
             "tool": "query_dataset", "args": {"operation": "missing_values"},
             "result_summary": f"{total} missing values", "success": True,
         })
 
-    # 4. Total inventory valuation
-    elif any(w in msg for w in ["total value", "total cost", "inventory value", "worth", "valuation"]):
-        if "Cost Price Total (USD)" in df.columns:
-            total = df["Cost Price Total (USD)"].sum()
-            avg = df["Cost Price Total (USD)"].mean()
-            result["response"] = (
-                f"💰 **Total Inventory Value:** **${total:,.2f}**\n\n"
-                f"- **Average product total cost:** ${avg:,.2f}\n"
-                f"- **Calculated across:** {len(df)} inventory items"
-            )
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "aggregate", "function": "sum", "column": "Cost Price Total (USD)"},
-                "result_summary": f"Total: ${total:,.2f}", "success": True,
-            })
-        else:
-            result["response"] = "Cost price total column not found in the dataset."
-
-    # 5. Most expensive products
-    elif any(w in msg for w in ["most expensive", "highest cost", "top price", "costliest", "highest unit price", "priciest"]):
-        col = "Cost Price Per Unit (USD)" if "Cost Price Per Unit (USD)" in df.columns else "Cost Price Total (USD)"
-        if col in df.columns:
-            display_cols = [c for c in ["Product ID", "Product Name", col] if c in df.columns]
-            top = df.nlargest(5, col)[display_cols]
-            result["response"] = f"**Top 5 most expensive products by `{col}`:**"
-            result["table_data"] = top
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "top_n", "column": col, "n": 5},
-                "result_summary": f"Top 5 by {col}", "success": True,
-            })
-        else:
-            result["response"] = "Price column not found in dataset."
-
-    # 6. Cheapest products
-    elif any(w in msg for w in ["cheapest", "lowest cost", "least expensive", "lowest unit price", "least costly"]):
-        col = "Cost Price Per Unit (USD)" if "Cost Price Per Unit (USD)" in df.columns else "Cost Price Total (USD)"
-        if col in df.columns:
-            display_cols = [c for c in ["Product ID", "Product Name", col] if c in df.columns]
-            bottom = df.nsmallest(5, col)[display_cols]
-            result["response"] = f"**Top 5 cheapest products by `{col}`:**"
-            result["table_data"] = bottom
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "bottom_n", "column": col, "n": 5},
-                "result_summary": f"Bottom 5 by {col}", "success": True,
-            })
-        else:
-            result["response"] = "Price column not found in dataset."
-
-    # 7. Low stock / Reorder alerts / Out of stock
-    elif any(w in msg for w in ["low stock", "lowest stock", "reorder", "out of stock", "least stock", "minimum stock", "shortage"]):
-        if "Hand-In-Stock" in df.columns:
-            display_cols = [c for c in ["Product ID", "Product Name", "Opening Stock", "Hand-In-Stock"] if c in df.columns]
-            low_stock = df.nsmallest(10, "Hand-In-Stock")[display_cols]
-            min_val = df["Hand-In-Stock"].min()
-            result["response"] = (
-                f"📦 **Top 10 Products with Lowest Stock on Hand:**\n"
-                f"- Lowest current stock level: **{min_val} units**\n"
-                f"- Review table below for items that may need replenishment."
-            )
-            result["table_data"] = low_stock
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "bottom_n", "column": "Hand-In-Stock", "n": 10},
-                "result_summary": f"10 items with lowest stock", "success": True,
-            })
-        else:
-            result["response"] = "Hand-In-Stock column not found."
-
-    # 8. Highest stock levels
-    elif any(w in msg for w in ["highest stock", "most stock", "maximum stock", "largest stock", "excess stock"]):
-        if "Hand-In-Stock" in df.columns:
-            display_cols = [c for c in ["Product ID", "Product Name", "Hand-In-Stock"] if c in df.columns]
-            high_stock = df.nlargest(10, "Hand-In-Stock")[display_cols]
-            result["response"] = "**Top 10 Products with Highest Hand-In-Stock:**"
-            result["table_data"] = high_stock
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "top_n", "column": "Hand-In-Stock", "n": 10},
-                "result_summary": "10 items with highest stock", "success": True,
-            })
-        else:
-            result["response"] = "Hand-In-Stock column not found."
-
-    # 9. Best selling / Units sold
-    elif any(w in msg for w in ["best selling", "top selling", "most sold", "highest units sold", "highest sales", "popular"]):
-        if "Number of Units Sold" in df.columns:
-            display_cols = [c for c in ["Product ID", "Product Name", "Number of Units Sold", "Hand-In-Stock"] if c in df.columns]
-            top_sold = df.nlargest(10, "Number of Units Sold")[display_cols]
-            total_sold = df["Number of Units Sold"].sum()
-            result["response"] = (
-                f"🔥 **Top 10 Best-Selling Products by Units Sold:**\n"
-                f"- **Total units sold across all products:** {total_sold:,} units"
-            )
-            result["table_data"] = top_sold
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "top_n", "column": "Number of Units Sold", "n": 10},
-                "result_summary": "Top 10 by units sold", "success": True,
-            })
-        else:
-            result["response"] = "Units sold column not found."
-
-    # 10. Least sold
-    elif any(w in msg for w in ["least sold", "lowest sold", "worst selling", "slowest moving", "least units sold"]):
-        if "Number of Units Sold" in df.columns:
-            display_cols = [c for c in ["Product ID", "Product Name", "Number of Units Sold", "Hand-In-Stock"] if c in df.columns]
-            least_sold = df.nsmallest(10, "Number of Units Sold")[display_cols]
-            result["response"] = "**Top 10 Slowest-Moving Products (Lowest Units Sold):**"
-            result["table_data"] = least_sold
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "bottom_n", "column": "Number of Units Sold", "n": 10},
-                "result_summary": "Bottom 10 by units sold", "success": True,
-            })
-        else:
-            result["response"] = "Units sold column not found."
-
-    # 10b. Generic Top N on any dataset column
-    elif any(w in msg for w in ["top", "highest", "largest", "maximum", "max", "best"]) and not any(w in msg for w in ["what is", "define"]):
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        matched_col = None
-        for c in num_cols:
-            if c.lower() in msg:
-                matched_col = c
-                break
-        if matched_col:
-            n_match = re.search(r'(?:top|highest|largest)\s*(\d+)', msg)
-            n = min(int(n_match.group(1)) if n_match else 5, len(df))
-            top_df = df.nlargest(n, matched_col)
-            result["response"] = f"**Top {n} records with highest `{matched_col}`:**"
-            result["table_data"] = top_df
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "top_n", "column": matched_col, "n": n},
-                "result_summary": f"Top {n} by {matched_col}", "success": True,
-            })
-
-    # 10c. Generic Bottom N on any dataset column
-    elif any(w in msg for w in ["bottom", "lowest", "smallest", "minimum", "min", "worst"]) and not any(w in msg for w in ["what is", "define"]):
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        matched_col = None
-        for c in num_cols:
-            if c.lower() in msg:
-                matched_col = c
-                break
-        if matched_col:
-            n_match = re.search(r'(?:bottom|lowest|smallest)\s*(\d+)', msg)
-            n = min(int(n_match.group(1)) if n_match else 5, len(df))
-            bot_df = df.nsmallest(n, matched_col)
-            result["response"] = f"**Bottom {n} records with lowest `{matched_col}`:**"
-            result["table_data"] = bot_df
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "bottom_n", "column": matched_col, "n": n},
-                "result_summary": f"Bottom {n} by {matched_col}", "success": True,
-            })
-
-    # 10d. Generic Sum / Total on any dataset column
-    elif any(w in msg for w in ["total", "sum of", "overall"]) and not any(w in msg for w in ["total products", "how many", "inventory value"]):
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        matched_col = None
-        for c in num_cols:
-            if c.lower() in msg:
-                matched_col = c
-                break
-        if matched_col:
-            c_sum = df[matched_col].sum()
-            result["response"] = f"The **total `{matched_col}`** across all {len(df)} records is **{c_sum:,.2f}**."
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "aggregate", "function": "sum", "column": matched_col},
-                "result_summary": f"Total {matched_col}: {c_sum}", "success": True,
-            })
-
-    # 11. Data Discrepancy / Formula Audit
-    elif any(w in msg for w in ["discrepancy", "discrepancies", "mismatch", "inconsistency", "formula error", "audit", "math check"]):
-        cols_needed = ["Opening Stock", "Purchase/Stock In", "Number of Units Sold", "Hand-In-Stock"]
-        if all(c in df.columns for c in cols_needed):
-            expected = df["Opening Stock"] + df["Purchase/Stock In"] - df["Number of Units Sold"]
-            diff = df["Hand-In-Stock"] - expected
-            mismatch_mask = diff != 0
-            mismatch_df = df[mismatch_mask].copy()
-            mismatch_df["Expected Stock"] = expected[mismatch_mask]
-            mismatch_df["Difference"] = diff[mismatch_mask]
-
-            display_cols = [c for c in ["Product ID", "Product Name", "Opening Stock", "Purchase/Stock In", "Number of Units Sold", "Hand-In-Stock", "Expected Stock", "Difference"] if c in mismatch_df.columns]
-            result["response"] = (
-                f"⚠️ **Inventory Formula Audit Found {len(mismatch_df)} Discrepancies:**\n\n"
-                f"- Formula tested: `Hand-In-Stock = Opening Stock + Purchase - Units Sold`\n"
-                f"- **{len(mismatch_df)} out of {len(df)} products** differ from the arithmetic expectation.\n"
-                f"- This may indicate inventory shrinkage, damage write-offs, or unrecorded adjustments in the source data."
-            )
-            result["table_data"] = mismatch_df[display_cols]
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "calculate_column"},
-                "result_summary": f"{len(mismatch_df)} discrepancies found", "success": True,
-            })
-        else:
-            result["response"] = "Required stock calculation columns not found in dataset."
-
-    # 12. Correlation
-    elif any(w in msg for w in ["correlation", "correlate", "relationship between"]):
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    # ------------------------------------------------------------------
+    # 4. Correlation
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["correlation", "correlate", "relationship between"]
+    ):
         if len(num_cols) > 1:
             corr_df = df[num_cols].corr().round(3)
-            result["response"] = "**Correlation Matrix Across Numeric Inventory Columns:**"
+            result["response"] = "**Correlation Matrix (numeric columns):**"
             result["table_data"] = corr_df
             result["tools_used"].append({
                 "tool": "query_dataset", "args": {"operation": "correlation"},
                 "result_summary": "Correlation matrix calculated", "success": True,
             })
         else:
-            result["response"] = "Not enough numeric columns for correlation."
+            result["response"] = "Not enough numeric columns to compute a correlation matrix."
 
-    # 13. Average / Mean statistics
-    elif any(w in msg for w in ["average", "mean", "median"]) and not any(w in msg for w in ["what is", "define"]):
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if num_cols:
-            means = df[num_cols].mean().round(2)
-            lines = [f"- **{col}**: {val:,.2f}" for col, val in means.items()]
-            result["response"] = "**Averages for Numeric Inventory Columns:**\n\n" + "\n".join(lines)
-            result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "aggregate", "function": "mean"},
-                "result_summary": f"Means computed for {len(num_cols)} columns", "success": True,
-            })
+    # ------------------------------------------------------------------
+    # 5. Average / Mean / Median
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["average", "mean", "median"]
+    ) and "define" not in msg and "what is" not in msg:
+        func = "median" if "median" in msg else "mean"
+        col = _find_mentioned_num_col(msg)
+        if col:
+            val = getattr(df[col], func)()
+            result["response"] = f"The **{func}** of `{col}` is **{val:,.4g}**."
+        elif num_cols:
+            vals = getattr(df[num_cols], func)().round(4)
+            lines = [f"- **{c}**: {v:,.4g}" for c, v in vals.items()]
+            result["response"] = f"**{func.capitalize()} for numeric columns:**\n\n" + "\n".join(lines)
         else:
-            result["response"] = "No numeric columns found."
+            result["response"] = "No numeric columns found in this dataset."
+        result["tools_used"].append({
+            "tool": "query_dataset", "args": {"operation": "aggregate", "function": func},
+            "result_summary": f"{func} computed", "success": True,
+        })
 
-    # 14. Product Search by Name or ID
-    elif "Product Name" in df.columns or "Product ID" in df.columns:
-        matched_rows = None
-        # Check if any product name is explicitly mentioned in msg
-        if "Product Name" in df.columns:
-            for p_name in df["Product Name"].dropna().unique():
-                if len(str(p_name)) > 2 and str(p_name).lower() in msg:
-                    matched_rows = df[df["Product Name"].str.lower() == str(p_name).lower()]
-                    break
-
-        # Check for Product ID pattern like P101, P102, etc.
-        if matched_rows is None or len(matched_rows) == 0:
-            id_match = re.search(r'\b(p\d{2,4})\b', msg, re.IGNORECASE)
-            if id_match and "Product ID" in df.columns:
-                target_id = id_match.group(1).upper()
-                matched_rows = df[df["Product ID"].str.upper() == target_id]
-
-        if matched_rows is not None and len(matched_rows) > 0:
-            result["response"] = f"Found product record for **{matched_rows.iloc[0].get('Product Name', 'Product')}**:"
-            result["table_data"] = matched_rows
+    # ------------------------------------------------------------------
+    # 6. Sum / Total
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["total", "sum of", "overall"]
+    ) and "how many" not in msg:
+        col = _find_mentioned_num_col(msg)
+        if col:
+            total = df[col].sum()
+            result["response"] = f"The **total `{col}`** is **{total:,.4g}**."
             result["tools_used"].append({
-                "tool": "query_dataset", "args": {"operation": "search_rows"},
-                "result_summary": f"Found {len(matched_rows)} matching record(s)", "success": True,
+                "tool": "query_dataset",
+                "args": {"operation": "aggregate", "function": "sum", "column": col},
+                "result_summary": f"Sum of {col}: {total}", "success": True,
+            })
+        elif num_cols:
+            totals = df[num_cols].sum()
+            lines = [f"- **{c}**: {v:,.4g}" for c, v in totals.items()]
+            result["response"] = "**Column totals:**\n\n" + "\n".join(lines)
+            result["tools_used"].append({
+                "tool": "query_dataset",
+                "args": {"operation": "aggregate", "function": "sum"},
+                "result_summary": "Column totals computed", "success": True,
             })
 
-    # 15. Preview / First few rows
-    if not result["response"] and any(w in msg for w in ["show", "preview", "sample", "first", "head"]):
-        n = 10
-        result["response"] = f"Here are the first {n} rows of the inventory dataset:"
+    # ------------------------------------------------------------------
+    # 7. Top N by a column
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["top", "highest", "largest", "maximum", "max", "best"]
+    ) and "define" not in msg and "what is" not in msg:
+        col = _find_mentioned_num_col(msg)
+        if col:
+            n_match = re.search(r'(?:top|highest|largest)\s*(\d+)', msg)
+            n = min(int(n_match.group(1)) if n_match else 5, len(df))
+            top_df = df.nlargest(n, col)
+            result["response"] = f"**Top {n} rows by `{col}`:**"
+            result["table_data"] = top_df
+            result["tools_used"].append({
+                "tool": "query_dataset",
+                "args": {"operation": "top_n", "column": col, "n": n},
+                "result_summary": f"Top {n} by {col}", "success": True,
+            })
+        elif num_cols:
+            # Default to first numeric column
+            col = num_cols[0]
+            top_df = df.nlargest(5, col)
+            result["response"] = f"**Top 5 rows by `{col}`** (first numeric column):"
+            result["table_data"] = top_df
+            result["tools_used"].append({
+                "tool": "query_dataset",
+                "args": {"operation": "top_n", "column": col, "n": 5},
+                "result_summary": f"Top 5 by {col}", "success": True,
+            })
+
+    # ------------------------------------------------------------------
+    # 8. Bottom N by a column
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["bottom", "lowest", "smallest", "minimum", "min", "worst", "least"]
+    ) and "define" not in msg and "what is" not in msg:
+        col = _find_mentioned_num_col(msg)
+        if col:
+            n_match = re.search(r'(?:bottom|lowest|smallest)\s*(\d+)', msg)
+            n = min(int(n_match.group(1)) if n_match else 5, len(df))
+            bot_df = df.nsmallest(n, col)
+            result["response"] = f"**Bottom {n} rows by `{col}`:**"
+            result["table_data"] = bot_df
+            result["tools_used"].append({
+                "tool": "query_dataset",
+                "args": {"operation": "bottom_n", "column": col, "n": n},
+                "result_summary": f"Bottom {n} by {col}", "success": True,
+            })
+        elif num_cols:
+            col = num_cols[0]
+            bot_df = df.nsmallest(5, col)
+            result["response"] = f"**Bottom 5 rows by `{col}`** (first numeric column):"
+            result["table_data"] = bot_df
+            result["tools_used"].append({
+                "tool": "query_dataset",
+                "args": {"operation": "bottom_n", "column": col, "n": 5},
+                "result_summary": f"Bottom 5 by {col}", "success": True,
+            })
+
+    # ------------------------------------------------------------------
+    # 9. Value counts for a categorical column
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["count", "frequency", "distribution", "breakdown", "how many"]
+    ) and not result["response"]:
+        col = _find_mentioned_col(msg)
+        if col and col in cat_cols:
+            vc = df[col].value_counts().head(20)
+            result["response"] = f"**Value counts for `{col}`:**"
+            result["table_data"] = vc.reset_index().rename(columns={"index": col, col: "count"})
+            result["tools_used"].append({
+                "tool": "query_dataset",
+                "args": {"operation": "value_counts", "column": col},
+                "result_summary": f"Value counts for {col}", "success": True,
+            })
+
+    # ------------------------------------------------------------------
+    # 10. Preview / First rows
+    # ------------------------------------------------------------------
+    if not result["response"] and any(
+        w in msg for w in ["show", "preview", "sample", "first", "head", "display"]
+    ):
+        n_match = re.search(r'first\s*(\d+)', msg)
+        n = min(int(n_match.group(1)) if n_match else 10, len(df))
+        result["response"] = f"Here are the **first {n} rows** of the dataset:"
         result["table_data"] = df.head(n)
         result["tools_used"].append({
             "tool": "query_dataset", "args": {"operation": "head", "n": n},
             "result_summary": f"First {n} rows", "success": True,
         })
 
-    # 16. Describe / Summary
-    elif not result["response"] and any(w in msg for w in ["describe", "summary", "statistics", "stats", "overview"]):
+    # ------------------------------------------------------------------
+    # 11. Describe / Summary statistics
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["describe", "summary", "statistics", "stats", "overview", "info"]
+    ):
         summary = get_dataset_summary(df)
-        response_lines = [
-            f"**Dataset Summary:**",
-            f"- **Total products:** {summary['total_products']}",
-            f"- **Total inventory value:** ${summary.get('total_inventory_value', 0):,.2f}",
-            f"- **Average cost per unit:** ${summary.get('avg_cost_per_unit', 0):,.2f}",
-            f"- **Total missing values:** {summary['total_missing']}",
+        lines = [
+            "**Dataset Summary:**",
+            f"- **Rows:** {summary['total_products']:,}",
+            f"- **Columns:** {len(summary['columns'])}",
+            f"- **Numeric columns:** {', '.join(summary.get('numeric_columns', [])) or 'none'}",
+            f"- **Categorical columns:** {', '.join(summary.get('categorical_columns', [])) or 'none'}",
+            f"- **Total missing values:** {summary['total_missing']:,}",
         ]
-        result["response"] = "\n".join(response_lines)
+        # Add numeric stats if present
+        for col, stats in (summary.get("numeric_stats") or {}).items():
+            lines.append(
+                f"- `{col}`: min={stats['min']:g}, max={stats['max']:g}, mean={stats['mean']:g}"
+            )
+        result["response"] = "\n".join(lines)
         result["table_data"] = df.describe(include="all")
         result["tools_used"].append({
             "tool": "query_dataset", "args": {"operation": "describe"},
             "result_summary": "Descriptive statistics", "success": True,
         })
 
-    # 17. External Definitions / Web Search
-    elif not result["response"] and any(w in msg for w in ["what is", "define", "definition of", "explain", "meaning of"]):
+    # ------------------------------------------------------------------
+    # 12. Text search across all string columns
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["search", "find", "look for", "locate"]
+    ):
+        # Extract a quoted or bare search term
+        quoted = re.search(r'"([^"]+)"|\'([^\']+)\'', user_message)
+        if quoted:
+            term = quoted.group(1) or quoted.group(2)
+        else:
+            # Remove common stopwords and use the rest
+            stopwords = {"search", "find", "look", "for", "locate", "me", "the", "a", "an"}
+            words = [w for w in user_message.split() if w.lower() not in stopwords]
+            term = " ".join(words)
+        if term:
+            mask = pd.Series([False] * len(df), index=df.index)
+            for c in cat_cols:
+                mask |= df[c].astype(str).str.contains(term, case=False, na=False)
+            matched = df[mask]
+            result["response"] = f"Found **{len(matched)} rows** matching `{term}`:"
+            result["table_data"] = matched
+            result["tools_used"].append({
+                "tool": "query_dataset",
+                "args": {"operation": "search_rows", "query": term},
+                "result_summary": f"Search for '{term}': {len(matched)} rows", "success": True,
+            })
+
+    # ------------------------------------------------------------------
+    # 13. External definitions / web search
+    # ------------------------------------------------------------------
+    elif not result["response"] and any(
+        w in msg for w in ["what is", "define", "definition of", "explain", "meaning of"]
+    ):
         search_res = web_search(user_message)
         if search_res.get("success") and search_res.get("results"):
             top = search_res["results"][0]
@@ -919,18 +907,22 @@ def run_agent_without_llm(
                 "result_summary": f"Found {len(search_res['results'])} external results", "success": True,
             })
 
-    # 18. Default Guidance
+    # ------------------------------------------------------------------
+    # 14. Default guidance
+    # ------------------------------------------------------------------
     if not result["response"]:
+        col_hint = f" (e.g. `{num_cols[0]}`)" if num_cols else ""
+        cat_hint = f" or categorical column (e.g. `{cat_cols[0]}`)" if cat_cols else ""
         result["response"] = (
-            "You can ask me questions about your inventory data such as:\n\n"
-            "- 📊 *How many products are in the dataset?*\n"
-            "- 💰 *What is the total inventory value?*\n"
-            "- 🏷️ *What are the most expensive or cheapest products?*\n"
-            "- 📦 *Which products have the lowest stock or need reordering?*\n"
-            "- 🔥 *What are the top selling products?*\n"
-            "- ⚠️ *Are there any inventory formula discrepancies?*\n"
-            "- 📋 *Show missing values or summary statistics*\n"
-            "- 🔍 *Search for any specific product name or ID*"
+            f"You can ask me questions about **{', '.join(all_cols[:4])}{'...' if len(all_cols) > 4 else ''}**. "
+            f"For example:\n\n"
+            f"- 📊 *Show me the first 10 rows*\n"
+            f"- 📈 *Describe / summarize this dataset*\n"
+            f"- 🔢 *What are the top 5 records by{col_hint}?*\n"
+            f"- 🔍 *Show missing values*\n"
+            f"- 🔗 *Show the correlation matrix*\n"
+            f"- 🗂️ *What are the unique values in a{cat_hint}?*\n"
+            f"- 🌐 *Search the web for a definition*"
         )
 
     return result
